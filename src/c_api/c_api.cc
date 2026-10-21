@@ -21,7 +21,7 @@
 #include "../common/error_msg.h"         // for DeprecatedFunc
 #include "../common/hist_util.h"         // for HistogramCuts
 #include "../common/io.h"                // for FileExtension, LoadSequentialFile, MemoryBuf...
-#include "../common/threading_utils.h"   // for OmpGetNumThreads, ParallelFor
+#include "../common/threading_utils.h"   // for GetNumThreads, ParallelFor
 #include "../data/adapter.h"             // for ArrayAdapter, DenseAdapter
 #include "../data/batch_utils.h"         // for MatchingPageBytes, CachePageRatio
 #include "../data/cat_container.h"       // for CatContainer
@@ -106,6 +106,12 @@ XGB_DLL int XGBuildInfo(char const **out) {
   info["USE_OPENMP"] = Boolean{true};
 #else
   info["USE_OPENMP"] = Boolean{false};
+#endif
+
+#if defined(XGBOOST_USE_THREADPOOL)
+  info["USE_THREADPOOL"] = Boolean{true};
+#else
+  info["USE_THREADPOOL"] = Boolean{false};
 #endif
 
 #if defined(__GNUC__) && !defined(__clang__)
@@ -547,7 +553,7 @@ XGB_DLL int XGDMatrixCreateFromCSC(char const *indptr, char const *indices, char
   xgboost_CHECK_C_ARG_PTR(c_json_config);
   auto config = Json::Load(StringView{c_json_config});
   float missing = GetMissing(config);
-  auto n_threads = OptionalArg<Integer, int64_t>(config, "nthread", common::OmpGetNumThreads(0));
+  auto n_threads = OptionalArg<Integer, int64_t>(config, "nthread", common::GetNumThreads(0));
   auto data_split_mode = OptionalArg<Integer, int64_t>(config, "data_split_mode", 0);
   xgboost_CHECK_C_ARG_PTR(out);
   ValidateCAPIDataSplitMode(data_split_mode);
@@ -1310,6 +1316,8 @@ XGB_DLL int XGBoosterPredictFromDMatrix(BoosterHandle handle, DMatrixHandle dmat
   auto p_m = *static_cast<std::shared_ptr<DMatrix> *>(dmat);
 
   auto type = PredictionType(RequiredArg<Integer>(config, "type", __func__));
+  CHECK_LE(static_cast<unsigned>(type), static_cast<unsigned>(PredictionType::kLeaf))
+      << "Unknown prediction type.";
   auto iteration_begin = RequiredArg<Integer>(config, "iteration_begin", __func__);
   auto iteration_end = RequiredArg<Integer>(config, "iteration_end", __func__);
 
@@ -1326,23 +1334,17 @@ XGB_DLL int XGBoosterPredictFromDMatrix(BoosterHandle handle, DMatrixHandle dmat
       type == PredictionType::kInteraction || type == PredictionType::kApproxInteraction;
   bool training = RequiredArg<Boolean>(config, "training", __func__);
   bool strict_shape = RequiredArg<Boolean>(config, "strict_shape", __func__);
-  learner->Predict(p_m, type == PredictionType::kMargin, &predictions, iteration_begin,
-                   iteration_end, training, type == PredictionType::kLeaf, contribs, approximate,
-                   interactions, strict_shape);
+  auto &shape = learner->GetThreadLocal().prediction_shape;
+  shape = learner->Predict(p_m, type == PredictionType::kMargin, &predictions, iteration_begin,
+                           iteration_end, training, type == PredictionType::kLeaf, contribs,
+                           approximate, interactions, strict_shape);
 
   xgboost_CHECK_C_ARG_PTR(out_result);
   *out_result = dmlc::BeginPtr(predictions.ConstHostVector());
 
-  auto &shape = learner->GetThreadLocal().prediction_shape;
-  auto chunksize = p_m->Info().num_row_ == 0 ? 0 : predictions.Size() / p_m->Info().num_row_;
-  auto n_rounds = iteration_end - iteration_begin;
-  n_rounds = n_rounds == 0 ? learner->BoostedRounds() : n_rounds;
-
   xgboost_CHECK_C_ARG_PTR(out_dim);
   xgboost_CHECK_C_ARG_PTR(out_shape);
-
-  CalcPredictShape(strict_shape, type, p_m->Info().num_row_, p_m->Info().num_col_, chunksize,
-                   learner->Groups(), n_rounds, &shape, out_dim);
+  *out_dim = shape.size();
   *out_shape = dmlc::BeginPtr(shape);
   API_END();
 }
@@ -1356,21 +1358,14 @@ void InplacePredictImpl(std::shared_ptr<DMatrix> p_m, char const *c_json_config,
   HostDeviceVector<float> *p_predt{nullptr};
   auto type = PredictionType(RequiredArg<Integer>(config, "type", __func__));
   float missing = GetMissing(config);
-  learner->InplacePredict(p_m, type, missing, &p_predt,
-                          RequiredArg<Integer>(config, "iteration_begin", __func__),
-                          RequiredArg<Integer>(config, "iteration_end", __func__));
-  CHECK(p_predt);
   auto &shape = learner->GetThreadLocal().prediction_shape;
-  auto const &info = p_m->Info();
-  auto n_samples = info.num_row_;
-  auto n_features = info.num_col_;
-  auto chunksize = n_samples == 0 ? 0 : p_predt->Size() / n_samples;
   bool strict_shape = RequiredArg<Boolean>(config, "strict_shape", __func__);
-
+  shape = learner->InplacePredict(
+      p_m, type, missing, &p_predt, RequiredArg<Integer>(config, "iteration_begin", __func__),
+      RequiredArg<Integer>(config, "iteration_end", __func__), strict_shape);
+  CHECK(p_predt);
   xgboost_CHECK_C_ARG_PTR(out_dim);
-  CalcPredictShape(strict_shape, type, n_samples, n_features, chunksize, learner->Groups(),
-                   learner->BoostedRounds(), &shape, out_dim);
-  CHECK_GE(p_predt->Size(), n_samples);
+  *out_dim = shape.size();
 
   xgboost_CHECK_C_ARG_PTR(out_result);
   xgboost_CHECK_C_ARG_PTR(out_shape);
